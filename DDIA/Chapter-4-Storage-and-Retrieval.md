@@ -49,6 +49,28 @@ db_get() {
 - `db_set key value`: Appends key-value pair to file (CSV-like format)
 - `db_get key`: Scans file for most recent value of key
 
+### Example Usage
+
+```bash
+$ db_set 12 '{"name":"London","attractions":["Big Ben","London Eye"]}'
+$ db_set 42 '{"name":"San Francisco","attractions":["Golden Gate Bridge"]}'
+$ db_get 42
+{"name":"San Francisco","attractions":["Golden Gate Bridge"]}
+```
+
+**Update example**:
+```bash
+$ db_set 42 '{"name":"San Francisco","attractions":["Exploratorium"]}'
+$ db_get 42
+{"name":"San Francisco","attractions":["Exploratorium"]}
+$ cat database
+12,{"name":"London","attractions":["Big Ben","London Eye"]}
+42,{"name":"San Francisco","attractions":["Golden Gate Bridge"]}
+42,{"name":"San Francisco","attractions":["Exploratorium"]}
+```
+
+**Note**: Old values not overwritten; `db_get` returns most recent (last occurrence) via `tail -n 1`
+
 ### Performance Characteristics
 
 **Write performance**: Excellent
@@ -113,6 +135,12 @@ db_get() {
 2. Append new key-value pair to log file
 3. Update hash map with new offset
 4. For reads: Use hash map to find offset, seek to location, read value
+
+**Example**:
+- Write key 42 → appended at byte offset 1234
+- Hash map stores: `{42: 1234}`
+- Read key 42 → Look up in hash map (instant), seek to byte 1234, read value
+- If value in filesystem cache, no disk I/O at all
 
 **Advantages**:
 - Much faster than scanning entire file
@@ -285,24 +313,28 @@ db_get() {
 - For each key: Compute hash → set of bit indexes
 - Set bits corresponding to those indexes to 1
 
-**Example**:
+**Building example**:
 - Key "handbag" hashes to (2, 9, 4)
 - Set bits 2, 9, 4 to 1
+- Key "handsome" hashes to (1, 5, 8)
+- Set bits 1, 5, 8 to 1
 - Store bitmap with sparse index
 
 ### Bloom Filter Queries
 
-**To check if key exists**:
-1. Compute same hash of key
-2. Check bits at those indexes
+**Query example**: Check if key "handheld" exists
+- Hash "handheld" → (6, 11, 2)
+- Check bits at indexes 6, 11, 2
+- If bit 6=0 → Key definitely NOT present (stop, skip this SSTable)
+- If all 1s → Key likely present (check sparse index to verify)
 
-**Interpretation**:
-- At least one bit is 0 → Key definitely NOT in SSTable
-- All bits are 1 → Key likely in SSTable (but false positive possible)
-
-**False positive**: Key looks present even though it isn't
-- No harm: Check sparse index and decode block anyway
-- No harm: Continue search with next segment
+**False positive example**:
+- Query "handiwork" (not in SSTable)
+- Hashes to (2, 9, 4)
+- By coincidence, bits 2, 9, 4 are all 1 (set by other keys)
+- Bloom filter says "maybe here" (false positive)
+- Must check sparse index → finds it's not actually there
+- No harm: Extra work but correct result
 
 ### False Positive Probability
 
@@ -452,12 +484,15 @@ RocksDB, SQLite, LMDB, DuckDB, KùzuDB
 - Each child responsible for continuous key range
 - Keys between references indicate range boundaries
 
-**Example** (Figure 4-5):
+**Lookup example** (Figure 4-5):
 - Looking for key 251
-- Root shows 200-300 range
-- Follow reference to that page
-- Further subdivides into 250-270 range
-- Eventually reach leaf page with individual keys
+- Root page contains key boundaries: 100-200, 200-300, 300-400, etc.
+- 251 falls in 200-300 range
+- Follow reference to that child page
+- Child page subdivides: 200-250, 250-270, 270-300
+- 251 falls in 250-270 range
+- Follow that reference to next level
+- Eventually reach leaf page with individual keys (key 251 found here or not)
 
 **Branching factor**: Number of references to child pages
 - Example: 6 in Figure 4-5
@@ -477,12 +512,17 @@ RocksDB, SQLite, LMDB, DuckDB, KùzuDB
 
 ### Page Splitting
 
-**Process** (Figure 4-6):
-- Want to insert key 334 in page for range 333-345 (already full)
-- Split into: 333-337 (with new key 334) and 337-345
-- Update parent page with references to both children, boundary value 337
-- If parent lacks space → parent split continues recursively
-- Splits can propagate to root
+**Process example** (Figure 4-6):
+- Insert key 334, but page for range 333-345 is already full
+- Split page into two:
+  - Left page: 333-337 (includes new key 334)
+  - Right page: 337-345
+- Update parent page:
+  - Previously had one child for 333-345
+  - Now has two children: 333-337 and 337-345
+  - Add boundary value 337 between the references
+- If parent page also full → parent splits too
+- Splits cascade upward if necessary
 - Root split → new root created above
 
 **Result**: Tree remains balanced
@@ -904,6 +944,26 @@ RocksDB, SQLite, LMDB, DuckDB, KùzuDB
 - SELECT * rarely needed for analytics
 - Still must load all 100 columns from disk
 
+**Example query**:
+```sql
+SELECT 
+  dim_date.weekday, dim_product.category,
+  SUM(fact_sales.quantity) AS quantity_sold
+FROM fact_sales
+JOIN dim_date ON fact_sales.date_key = dim_date.date_key
+JOIN dim_product ON fact_sales.product_sk = dim_product.product_sk
+WHERE
+  dim_date.year = 2024 AND
+  dim_product.category IN ('Fresh fruit', 'Candy')
+GROUP BY dim_date.weekday, dim_product.category;
+```
+
+**Analysis**: 
+- Fact table has 100+ columns
+- Query needs only 3: date_key, product_sk, quantity
+- Row-oriented storage loads all 100 columns from disk
+- Wasteful: 97 columns ignored for every row accessed
+
 **Solution**: Column-oriented storage
 
 ### How It Works
@@ -971,26 +1031,38 @@ RocksDB, SQLite, LMDB, DuckDB, KùzuDB
 - Bit per row: 1 if row has value, 0 if not
 
 **Example**:
-- product_sk column with thousands of products
-- Create 3-bitmap for each product
-- Bit set if row has that product
+- product_sk column with say 100,000 distinct products
+- Create one bitmap per product (e.g., bitmap for product_id=31)
+- For each row: bit = 1 if that row's product_sk = 31, else 0
+- Bitmap looks like: 00101010000000101... (mostly 0s for sparse data)
+- Run-length encode: "8 zeros, 1 one, 5 zeros, 1 one, 14 zeros..." (compact)
 
 **Sparse handling**:
 - Bitmaps contain many 0s (sparse)
-- Run-length encoding: Count consecutive 0s/1s
-- Roaring bitmaps: Switch between representations (compact)
+- Run-length encoding: Count consecutive 0s/1s instead of storing each
+- Roaring bitmaps: Switch between representations (sparse vs dense) to keep compact
 
 ### Bitmap Index Queries
 
-**WHERE clause examples**:
+**WHERE clause example 1**:
+```sql
+WHERE product_sk IN (31, 68, 69)
+```
+- Load bitmap for product_sk=31: 0010101...
+- Load bitmap for product_sk=68: 1000010...
+- Load bitmap for product_sk=69: 0100100...
+- Bitwise OR: Result has 1 if ANY of three products match
+- Result: 1110111... (rows with product 31, 68, or 69)
 
-1. `WHERE product_sk IN (31, 68, 69)`:
-   - Load 3 bitmaps
-   - Bitwise OR efficiently
-
-2. `WHERE product_sk = 30 AND store_sk = 3`:
-   - Load 2 bitmaps
-   - Bitwise AND (columns same row order, kth bits correspond)
+**WHERE clause example 2**:
+```sql
+WHERE product_sk = 30 AND store_sk = 3
+```
+- Load bitmap for product_sk=30: 0101010...
+- Load bitmap for store_sk=3: 1100110...
+- Bitwise AND: Result has 1 if BOTH conditions true
+- Result: 0100010... (rows with product 30 AND store 3)
+- Works because columns stored in same row order (kth bit = kth row in both)
 
 **Graph queries**: Can find users in social network matching conditions
 
@@ -1110,10 +1182,15 @@ RocksDB, SQLite, LMDB, DuckDB, KùzuDB
 2. Process many values in batch
 3. Predefined operators built-in
 4. Pass arguments, get batch results
-5. Example (Figure 4-9):
-   - Pass product_sk column + product ID → equality operator → bitmap
-   - Pass store_sk column + store ID → equality operator → bitmap
-   - Pass 2 bitmaps to bitwise AND operator → result bitmap
+
+**Example query**: `WHERE product_sk = "bananas" AND store_sk = 5` (Figure 4-9):
+- Pass product_sk column [apple, banana, orange, banana, apple, ...] + "bananas" to equality operator
+  - Result bitmap: [0, 1, 0, 1, 0, ...]
+- Pass store_sk column [5, 3, 5, 5, 3, ...] + 5 to equality operator
+  - Result bitmap: [1, 0, 1, 1, 0, ...]
+- Pass both bitmaps to bitwise AND operator
+  - Result: [0, 0, 0, 1, 0, ...] (only row 4 matches both conditions)
+- Process entire batches at once with optimized bit operations (SIMD instructions)
 
 ### Performance Optimizations
 
@@ -1155,19 +1232,33 @@ RocksDB, SQLite, LMDB, DuckDB, KùzuDB
 
 **Setup**: 2 dimensions (date_key, product_sk)
 
-**Structure**:
-- 2D table (dates × products)
-- Each cell = aggregate (SUM) for that date-product combination
-- Apply aggregate along rows/columns → reduced by one dimension
+**Structure example**:
+```
+          Apple  Banana  Orange  Milk
+2024-01-01  150     200     100    300
+2024-01-02  120     180      95    280
+2024-01-03  175     210     110    320
+```
+- Rows = dates
+- Columns = products
+- Each cell = SUM of sales quantity for that date-product
+- Can aggregate across rows: Total sales per product (ignore date)
+- Can aggregate across columns: Total sales per date (ignore product)
 
 **Multi-dimensional**:
 - Typical: 5 dimensions (date, product, store, promotion, customer)
-- Principle same (hypercube)
-- Each cell = aggregate for combination
+- Principle same (hypercube, not 2D table)
+- Each cell = aggregate for date-product-store-promotion-customer combination
 
 **Query benefit**: Certain queries very fast
-- Example: Total sales per store yesterday → look at appropriate dimension totals
-- No need to scan millions of rows
+- Query: "Total sales per store yesterday"
+- Answer: Look at single row (yesterday) aggregated across stores
+- No need to scan millions of individual rows
+
+**Example with 3 dimensions**:
+- Query: "Sales of Apples, store #5, any date"
+- Slice the cube: Fix product=Apple, store=5, look across all dates
+- Already precomputed, instant answer
 
 ### Data Cube Trade-offs
 
@@ -1209,14 +1300,21 @@ RocksDB, SQLite, LMDB, DuckDB, KùzuDB
 **Importance**: Geospatial data (latitude, longitude)
 
 **Use case example**: Restaurant search on map
-- User viewing rectangular area
-- Need all restaurants within latitude/longitude ranges
-- Two-dimensional range query
+- User viewing rectangular area bounded by coordinates
+- Query example:
+  ```sql
+  SELECT * FROM restaurants 
+  WHERE latitude > 51.4946 AND latitude < 51.5079
+  AND longitude > -0.1162 AND longitude < -0.1004;
+  ```
+- Need all restaurants within latitude AND longitude ranges simultaneously
 
 **Concatenated limitation**: Can't answer efficiently
-- Either: All restaurants in latitude range (any longitude)
-- Or: All restaurants in longitude range (any latitude)
-- Not both simultaneously
+- Concatenated index on (latitude, longitude) can find:
+  - All restaurants in latitude range 51.4946-51.5079 (at any longitude)
+  - All restaurants in longitude range -0.1162 to -0.1004 (at any latitude)
+  - Cannot efficiently find restaurants in BOTH ranges simultaneously
+  - Would return many restaurants outside the rectangular viewing area
 
 ### Spatial Indexing Solutions
 
@@ -1270,13 +1368,19 @@ RocksDB, SQLite, LMDB, DuckDB, KùzuDB
 
 **Data structure**: Key-value where key=term, value=list of document IDs (postings list)
 
+**Example**:
+- Term "apple": [5, 12, 47, 312] (documents containing "apple")
+- Term "banana": [3, 12, 89, 312] (documents containing "banana")
+
 **Representation**: Document IDs sequential
 - Postings list can be sparse bitmap
+- Bitmap for "apple": [0, 0, 0, 0, 0, 1, 0, ..., 1, ..., 1, ..., 1, ...] (1s at positions 5, 12, 47, 312)
 - nth bit in bitmap for term = 1 if document n contains term
 
-**Query**: Find documents with terms x and y
-- Load bitmaps for x, y
-- Bitwise AND efficiently
+**Query example**: Find documents with terms "apple" AND "banana"
+- Load bitmap for "apple": [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, ...]
+- Load bitmap for "banana": [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, ...]
+- Bitwise AND: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, ...] (only document 12 and 312 have both)
 - (Similar to vectorized warehouse query, Figure 4-9)
 
 ### Implementation Examples
@@ -1341,14 +1445,24 @@ RocksDB, SQLite, LMDB, DuckDB, KùzuDB
 - Each floating-point value = dimension position
 - Embedding models generate similar vectors for similar documents
 
-**Example**:
-- Agriculture page: [0.38, 0.83, 0.41]
-- Vegetables page: [0.36, 0.64, 0.67] (nearby)
-- Star schema page: [0.85, 0.10, -0.52] (far)
+**Example with 3-dimensional embeddings**:
+- Agriculture Wikipedia page: [0.38, 0.83, 0.41]
+- Vegetables Wikipedia page: [0.36, 0.64, 0.67]
+  - Nearby (visually close in 3D space - agriculture related)
+- Star schema Wikipedia page: [0.85, 0.10, -0.52]
+  - Far away (different topic - database design)
 
-**Real vectors**: Often 1000+ dimensions
+**Similarity observation**: First two vectors close together (similar concept), third vector different
+
+**Real vectors**: Often 1000+ dimensions (individual values meaningless, location in space matters)
 
 **Principles**: Same even with many dimensions
+
+**Search example**:
+- User searches: "how to close my account"
+- Embedding model converts to vector: [0.41, 0.79, 0.38, ...] (1000+ values)
+- Search engine finds nearby vectors in document collection
+- Returns: "cancel subscription", "terminate contract" pages (close in semantic space, different words)
 
 ### Embedding Models
 
